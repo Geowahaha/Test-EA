@@ -1,0 +1,976 @@
+//+------------------------------------------------------------------+
+//|                                                     AIExpert.mq4 |
+//|                        Copyright 2018, MetaQuotes Software Corp. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "aaat"
+#property link      "www.aaa.com"
+#property version   "1.00"
+#property strict
+
+#define EA_magic  20131778
+#define tFeatureSize 3
+
+input double      MinTP_Buy                        =  15;   
+//minimal take profit for buying... means if CertaintyFactorSatisfied is 0.7 and the prediction forecasts 70% Certainty that buying will be good, take profit will be 15...
+input double      MaxTP_Buy                        =  25;   
+//maximal take profit for buying    ...if the predicted Certainty is 100%, take profit will be higher --> 25
+input double      MinTP_Sell                       =  15;   
+//minimal take profit for selling ..same 
+input double      MaxTP_Sell                       =  25;   
+//maximal take profit for selling ...
+input double      MinSLP                           =  20;   
+//minimal stop loss, same like take profit... the actual value orientates on the certainty of the prediction... a higher certainty leads to more trust and for that in wider stop loss ranges!
+input double      MaxSLP                           =  40;   
+// see minSLP
+input double      SLIPPAGE                         =  10000;
+input double      StartLotSize                     =  0.5;  
+//size of mthe lots from the beginning
+input double      Lots                             =  3;    
+// number of lots
+input double      CertaintyFactorSatisfied_Buy     =  0.7;  
+//Certainty at which to start sending buy orders
+input double      UnCertaintyFactorSatisfied_Buy   =  0.4;  
+//UnCertainty of sell and hold at which to stopp sending buy orders even if certaintyfactorsatisfied_buy is reached. 
+//If softmax activation functions are used, the sum of all predictions is 1!, If sigmoid is used, the sum can be more than 1!!!
+input double      CertaintyFactorSatisfied_Sell    =  0.7;  
+//Certainty at which to start sending sell orders
+input double      UnCertaintyFactorSatisfied_Sell  =  0.4;  
+//UnCertainty of buy and hold at which to stopp sending sell orders even if certaintyfactorsatisfied_sell is reached. 
+//If softmax activation functions are used, the sum of all predictions is 1!, If sigmoid is used, the sum can be more than 1!!!
+input int         OrderLimit                       =  4;    
+//maximum amount of positions running
+input string      API_Request_ID                   =  "5e1dc8060460653432551223"; 
+//API-Request identification number
+input string      ServerURL                        =  "http://127.0.0.1";
+input int         StartHour                        =  08;   
+//start trading at this time
+input int         EndHour                          =  22;   
+//end trading at this time
+input int         CloseHour                        =  22;   
+//close all open positions at this time
+input int         WindowSize                       =  20;   
+//window size used for the sequencialisation
+input int         CloseAfterHoursPassed            =  4;    
+//position is closed after this period of hours, this should normally satisfy the prediction-horizon
+input string      IndicatorList                    =  "High;Low;Close;Open;Gradient;Delta;Volume;ExcelTimeRatio;DayOfWeek;Momentum_14;Momentum_100;Accelerator;Bears;Bulls;Awesome;RSI;RSI_10;RSI_120;RSI_30;RSI_80;NyquistMA";
+input int         StopTadingByErrorTrades          =  4;    
+//stops the trading for the day when 4 or more bad trades occured
+input double      StopTradingByLossMoney           =  40.0f;
+//stops the trading for the day when more than 40 €/$/... loss at a day occured
+input string      LogFile                          =  "test_mt4.txt";
+input bool        AlertMe                          =  false;
+input int         OrderAttempts                    =  10;   
+//if order could not be opened we try it agaion for this variable times
+
+//Special buffering LSTM Input params
+//input int         BufferSize                       = 12;
+//input string      PreTrainedLSTMModel_Name         = "Concat_22_4LSTM_26var";
+
+//Trailing Stop params
+input bool        UseTrailingStop                  = false;
+input double      MinProfitThreshold               = 15; 
+input double      MinProfitVal                     = 5; 
+
+input bool        SkipGaps                         = true;
+
+//boolean skip gaps
+
+/*
+@MinProfitThreshold - //threshold value, if we reach this value we calculate a new sl
+@MinProfitVal - // mimnimum points we want to take
+*/
+
+class BSH_Values {
+   public:
+      double buy;
+      double sell;
+      double hold;
+      //--- Default constructor
+      BSH_Values(void) {
+         this.buy    = -1.0f;
+         this.sell   = -1.0f;
+         this.hold   = -1.0f;
+      };
+      //--- Parametric constructor
+      BSH_Values(double pHold, double pBuy, double pSell) {
+         this.buy  = pBuy;
+         this.sell = pSell;
+         this.hold = pHold;
+      };
+};
+ 
+ 
+class FeatureValues {
+   public:
+      double values[];
+      
+      FeatureValues(){};
+      
+      FeatureValues(int pSize) {
+         ArrayResize(values, pSize, 0);
+      };
+};
+
+
+//Workaround class because arrays could not hold an array we define objects
+//that include our array and use them as array
+class Indicator {
+  public:
+      string mIndicatorName;
+      string mParamArr[];
+      
+      Indicator(string pIndicatorName){
+         this.mIndicatorName = pIndicatorName;
+      };
+      
+      Indicator(string pIndicatorName, string &pParamArr[]){
+         this.mIndicatorName = pIndicatorName;
+         
+         ArrayResize(mParamArr, ArraySize(pParamArr));
+         for(int i=0; i< ArraySize(pParamArr); i++){
+            this.mParamArr[i] = pParamArr[i];
+         }
+      };
+      
+      int getParamCount() {
+         return ArraySize(mParamArr);
+      }
+};
+ 
+ 
+//+------------------------------------------------------------------+
+//| Script Variables                                                |
+//+------------------------------------------------------------------+ 
+long        mOldBarTime;
+BSH_Values* mOldBSHVs;
+Indicator*  mIndicators[];
+int         mFeatureCount;
+int         mLogFileHandle;
+ 
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+ 
+string buildJsonArray(double &tArray[], string tArrayName) {
+   string tRes = "";
+
+   tRes = tRes + "\""+tArrayName+"\":[";
+   for(int i=0; i<ArraySize(tArray); i++) {
+       tRes = tRes + DoubleToStr(tArray[i]);
+       if(i+1 < ArraySize(tArray)){
+         tRes = tRes + ","; 
+       }
+   }
+   tRes = tRes + "]"; 
+   
+   return tRes;
+}
+
+string build2DJsonArray(FeatureValues &pArray[], /*double &tArray[][],*/ string pArrayName) {
+   string tRes = "";
+   int tFeatureCount = ArrayRange(mIndicators, 0); 
+   
+   tRes = tRes + "\""+pArrayName+"\":[[";
+      
+   //Print("ArrayRange(0)", ArrayRange(pArray, 0));
+   //Print("ArrayRange(1)", tFeatureCount);
+   
+   for(int i=0; i < ArrayRange(pArray, 0); i++) {
+      //tRes = tRes + "[";
+      for(int j=0; j < tFeatureCount; j++) {
+         tRes = tRes + DoubleToStr(pArray[i].values[j]);
+         if(j+1 < tFeatureCount) {
+            tRes = tRes + ","; 
+         }
+      }
+      //tRes = tRes +"]";
+      
+      if(i+1 < ArrayRange(pArray, 0)) {
+         tRes = tRes + ","; 
+      }
+   }
+   tRes = tRes + "]]"; 
+   //Print("tRes:", tRes);
+   return tRes;
+}
+
+
+
+//@îsGap:
+//checks if the current data point
+//    --> is value equivalent to the next one (or previous one would of course also be possible). 
+//    --> Has in in all 4 values of the ohcl candle (open, low, close. high) the same value
+//if this is the case we have a gap and return true
+bool isGap(int pIdx) {
+   if(!SkipGaps) {
+      return false;
+   } else {
+      //check for gap
+      //condition 1: current data point is identical to the next one
+      //TODO: add security check so index can not be out of range
+      bool Cond1 = (Close[pIdx] == Close[pIdx+1]  &&
+                     Open[pIdx]  == Open[pIdx+1]   &&
+                     High[pIdx]  == High[pIdx+1]   &&
+                     Low[pIdx]   == Low[pIdx+1]);
+                     
+      //we use a little logic trick to save one comparision. If C==O && H==L than if C==L (or any combinadtion of the first thermes) all values are the same.
+      bool Cond2 = (Close[pIdx] == Open[pIdx] && High[pIdx] == Low[pIdx] && Close[pIdx] == Low[pIdx]);
+      return Cond1 && Cond2;      
+   }
+}
+
+
+
+string generateLSTMPostData() { 
+   FeatureValues resultArray[];
+   ArrayResize(resultArray, WindowSize); 
+   /* Todo implement gap algo:
+   Algo description:
+   1. Find 1h barShift (= (60 / TimePeriod)) 
+   2. Calc TimeDelta = (EndTime - StartTime)
+   3. Find timeShift (= barShift * TimeDelta)
+   4. Calc current overlayDelta (= CurrentTime - StartTime)
+   5. Find not to used timeShiftSteps (=overlayDelta * barShift)
+   6. From 1 to timeShiftSteps use normal Formular
+   7. From timeShiftSteps to WindowSize use timeShift for shifting the timesteps
+   */
+   
+   /*Todo: at sanity Check (--> breaks EAI on startup when invalid input params)
+   1. EndTime > StartTime Input Param
+   2. Period() <= 60, or better == 5
+   */
+
+   //Because when we skip values we will not fill our data vector completly 
+   //we count our skips to subtract this value later on our current index
+   
+   int tSkips = 0; 
+  
+   //last element (at the right of the array) is our current value   
+   //skip the current value if it is a gap
+   //because when we skipped some values we also have add that gaps to the WindowSize, elsewise we will not fill our dataVector with enough values
+   for(int i=1;i<=WindowSize + tSkips;i++) { 
+      if(SkipGaps && isGap(i)){ 
+         tSkips++; //increment window size (so the missing value (because of skipping a gap is considered)
+         continue;
+      } 
+      
+      int dataVecIdx = i - tSkips; //value that holds at which position the current calculated values should be stored, because we could skip some gaps this value is the difference from real position (i) and the skipped values (tSkips)
+      
+      ArrayResize(resultArray[(WindowSize) - dataVecIdx].values, mFeatureCount);
+      for(int j=0; j<mFeatureCount; j++) {
+         Indicator* tIndicator = mIndicators[j];
+         int tParamCount = tIndicator.getParamCount();
+
+         
+         switch(tParamCount) {
+            case 0:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,0,i);
+               break;
+            
+            case 1:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,StringToDouble(tIndicator.mParamArr[0]),0,i);
+               break;
+               
+            case 2:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,
+                  StringToDouble(tIndicator.mParamArr[0]),
+                  StringToDouble(tIndicator.mParamArr[1]),
+                  0,i
+               );
+               break;
+               
+            case 3:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,
+                  StringToDouble(tIndicator.mParamArr[0]),
+                  StringToDouble(tIndicator.mParamArr[1]),
+                  StringToDouble(tIndicator.mParamArr[2]),
+                  0,i
+               );
+               break;
+               
+            case 4:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,
+                  StringToDouble(tIndicator.mParamArr[0]),
+                  StringToDouble(tIndicator.mParamArr[1]),
+                  StringToDouble(tIndicator.mParamArr[2]),
+                  StringToDouble(tIndicator.mParamArr[3]),
+                  0,i
+               );
+               break;
+               
+            case 5:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,
+                  StringToDouble(tIndicator.mParamArr[0]),
+                  StringToDouble(tIndicator.mParamArr[1]),
+                  StringToDouble(tIndicator.mParamArr[2]),
+                  StringToDouble(tIndicator.mParamArr[3]),
+                  StringToDouble(tIndicator.mParamArr[4]),
+                  0,i
+               );
+               break;
+               
+            case 6:
+               resultArray[(WindowSize) - dataVecIdx].values[j] = iCustom(NULL,0,"OpenAI Indicators\\"+tIndicator.mIndicatorName,
+                  StringToDouble(tIndicator.mParamArr[0]),
+                  StringToDouble(tIndicator.mParamArr[1]),
+                  StringToDouble(tIndicator.mParamArr[2]),
+                  StringToDouble(tIndicator.mParamArr[3]),
+                  StringToDouble(tIndicator.mParamArr[5]),
+                  0,i
+               );
+               break;
+         }
+      }
+   }
+   
+   //for(int t = 0; t < WindowSize; t++) {
+      //Print(t + ":", resultArray[t].values[0]);
+   //}
+   
+   
+   if(mLogFileHandle > 0) {
+      int tArraySize = ArraySize(resultArray);
+      //Print ("tArraySize", tArraySize);
+      for(int j=0; j<tArraySize; j++) {
+         for(int i=0; i<mFeatureCount; i++) {
+            FileWriteString(mLogFileHandle, DoubleToStr(resultArray[j].values[i]));
+            FileWriteString(mLogFileHandle, ",");                               
+         }
+         FileWriteString(mLogFileHandle, "\n");
+      }
+   }
+   
+   FileWriteString(mLogFileHandle, "-------------------------------------\n");
+   
+   string resultString = "{" + build2DJsonArray(resultArray, "input_0") + ", \"format\":\"array\", \"window_size\":"+WindowSize+"}";
+            
+   return resultString;
+}
+
+
+ 
+ string post(string tUrl, string tPostData) {
+   string cookie=NULL;
+   string headers = "Content-Type:application/json";
+   string result_header;
+   char post[];
+   char result[];
+   int res;
+   
+   ResetLastError(); //--- den letzten Fehlercode rücksetzen
+   int timeout=5000; //--- Timeout weniger als 1000 (1 Sek.) ist nicht ausreicht bei einer niedrigen Geschwindigkeit von Internet
+   int intHostNameLength=StringLen(tPostData);
+   StringToCharArray(tPostData, post, 0, intHostNameLength);
+   res=WebRequest("POST", tUrl, headers, timeout, post, result, result_header);
+   
+   if(res==-1) { //--- Fehlerprüfung  
+      int tError = GetLastError();
+      Print("Fehler in WebRequest. Fehlercode =", IntegerToString(tError));
+      Print("Result: ", CharArrayToString(result));
+      
+      //MessageBox(); //--- Vielleicht ist diese URL in der Liste nicht geschrieben; eine Meldung über die Notwendigkeit es hinzuzufügen anzeigen
+      //MessageBox("Die Adresse '"+tUrl+"' muss in der Liste der erlaubten URLs auf der Registerkarte 'Experten' hinzugefügt werden","Ein Fehler",MB_ICONINFORMATION);
+      return "Error";
+   } else { //--- erfolgreiches Herunterladen
+      string tParsedResult = CharArrayToString(result);
+      return tParsedResult;
+   }
+   return "";
+} 
+
+
+int OnInit() {
+   EventSetTimer(60);  
+   mOldBSHVs = new BSH_Values();
+   mOldBarTime = Time[0]; //store init candle time value for distinguish later when a new candle occured.
+   string tIndicatorArr[];
+   string tIndicatorDef = IndicatorList; 
+   StringReplace(tIndicatorDef, " ", ""); //clean up white spaces
+   mFeatureCount = StringSplit(tIndicatorDef, ';', tIndicatorArr);
+   ArrayResize(mIndicators, mFeatureCount); 
+   string tLogFileHeadLine = "";
+   
+   if(LogFile != NULL && LogFile != "") {
+      //string terminal_data_path=TerminalInfoString(TERMINAL_DATA_PATH);
+      //string filename=terminal_data_path+"\\MQL4\\Files\\"+LogFile;
+      //Print("---------------------------------");
+      //Print(LogFile);
+      string terminal_data_path=TerminalInfoString(TERMINAL_DATA_PATH);
+      //Print(terminal_data_path);
+      mLogFileHandle = FileOpen("Files\\" + LogFile, FILE_WRITE|FILE_ANSI);          
+   }
+   
+   if(mLogFileHandle==INVALID_HANDLE) {
+      Print("Invalid Log File");
+      Print("Failed to open the file by the absolute path ");
+      Print("Error code ",GetLastError());
+   }
+   
+   //parse indicator list with function brackets
+   for(int i=0; i<ArrayRange(tIndicatorArr,0); i++) {
+      Indicator* tIndicator = NULL;
+      string tIndi = tIndicatorArr[i];
+      int tStartPos = StringFind(tIndi, "(");
+      int tEndPos =  StringFind(tIndi, ")");
+        
+      //case 1: no params and no function declarations
+      if(tStartPos == -1 && tEndPos == -1) {
+         tIndicator = new Indicator(tIndi);
+      } 
+      
+      //case 2: function brackets where found
+      if(tStartPos != -1 && tEndPos != -1) { 
+          int tSubStringLen = tEndPos - tStartPos;
+          string tParamSubStr = StringSubstr(tIndi, tStartPos+1, tSubStringLen - 1);
+          string tParams[];
+          string tIndiName = StringSubstr(tIndi, 0, tStartPos);
+          StringSplit(tParamSubStr, ',', tParams);
+          
+          //special case if somebody setted the brackets but no values inside (the array will then be initialized by StringSplit() with one value thas is 0, so we check for that case and let the param array be empty then). 
+          //Print("------------------------------");
+          //Print("StringLen: ", StringLen(tParamSubStr));
+          //Print("tParamSubStr: ",tParamSubStr);
+          if(StringLen(tParamSubStr) > 1) {
+            StringSplit(tParamSubStr, ',', tParams);
+          }
+          
+          tIndicator = new Indicator(tIndiName, tParams);
+      }
+      
+      //case 3: illegalv indicator or param definition
+      if(tIndicator == NULL) {
+         Alert("Indicater definition invalid.");
+      }
+      
+      mIndicators[i] = tIndicator;
+      
+      if(mLogFileHandle > 0) {
+         tLogFileHeadLine += tIndi + ",";  
+      }
+      
+
+      
+      //Print("IndiName: ", tIndicator.mIndicatorName);
+      
+      //for(int j=0; j<ArraySize(tIndicator.mParamArr); j++){
+         //Print("IndiParam: ", tIndicator.mParamArr[j]);
+      //}
+      
+ 
+   }
+   
+   if(mLogFileHandle > 0) {
+      FileWrite(mLogFileHandle, tLogFileHeadLine + "Buy,Sell,Hold");
+   }
+   
+   
+   return(INIT_SUCCEEDED);
+  }
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+//--- destroy timer
+   EventKillTimer();
+}
+  
+
+void drawOnIndicator(string pName, int pIndicatorWindowID, double pLastValue, double pValue, color pColor) {
+   string   objName  = pName + "_" + TimeToStr(Time[0]);
+   
+   if(pLastValue >= 0) {
+      ObjectCreate(objName, OBJ_TREND, pIndicatorWindowID, Time[1], pLastValue * 100, Time[0], pValue * 100); 
+      ObjectSet(objName, OBJPROP_COLOR, pColor);
+      ObjectSet(objName, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSet(objName, OBJPROP_WIDTH, 2);
+      ObjectSet(objName, OBJPROP_RAY, False);
+   }
+}
+
+void closePositionsBeforeDayEnd(){
+ //----hier können alle laufenden Positionen vor Ende des Handelstages geschlossen werden, wenn nicht auskommentiert
+   int ticket;
+   if (Hour() >= CloseHour){
+      for (int i=OrdersTotal()-1; i>=0; i--) {// alta russen code?! :'-D pozicio kivalasztasa
+         if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES)==true) { //ha kivalasztas ok
+            Print ("order ticket: ", OrderTicket(), "order magic: ", OrderMagicNumber());
+            if (OrderType()==0){//ha long
+               ticket=OrderClose(OrderTicket(), OrderLots(), MarketInfo(OrderSymbol(),MODE_BID), 3,Red);
+               
+               if (ticket==-1) 
+                  Print ("Error: ",  GetLastError());
+                  
+               if (ticket>0) 
+               Print ("Position ", OrderTicket() ," End of trading, all orders closed");
+            }
+            if (OrderType()==1) {//ha short
+               ticket=OrderClose(OrderTicket(),OrderLots(), MarketInfo(OrderSymbol(),MODE_ASK), 3,Red);
+               if (ticket==-1) 
+                  Print ("Error: ",  GetLastError());
+               if (ticket>0) 
+                  Print ("Position ", OrderTicket() ," End of trading, all orders closed");
+            }   
+         }
+      }
+   }
+}
+
+
+void oneCanclesOther(int pAction) {
+   for(int i=OrdersTotal()-1; i>=0; i--) {
+      if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES)==true) {
+         if(OrderSymbol()==Symbol()) {
+            if(pAction == +1 && OrderType()==OP_SELL && OrdersTotal()>0) {
+               int ticket=OrderClose(OrderTicket(),OrderLots(), MarketInfo(OrderSymbol(),MODE_ASK),3,Red);
+            }
+            
+            if(pAction == -1 && OrderType()==OP_BUY && OrdersTotal()>0) {
+               int ticket=OrderClose(OrderTicket(),OrderLots(), MarketInfo(OrderSymbol(),MODE_BID),3,Blue);
+
+            }               
+         }
+      }
+   }
+}
+
+
+//trading action to perform +1 = buy, -1 = sell, 0 = nothing
+int getTradingAction(BSH_Values &pCurrBSHVs) {
+   int tAction = 0;
+   
+   if(pCurrBSHVs.buy >= CertaintyFactorSatisfied_Buy && 
+     (pCurrBSHVs.buy-pCurrBSHVs.sell) >= UnCertaintyFactorSatisfied_Buy &&
+     (pCurrBSHVs.buy-pCurrBSHVs.hold) >= UnCertaintyFactorSatisfied_Buy) {
+      tAction = 1; 
+   }
+   
+   if(pCurrBSHVs.sell >= CertaintyFactorSatisfied_Sell && 
+     (pCurrBSHVs.sell-pCurrBSHVs.buy) >= UnCertaintyFactorSatisfied_Sell &&
+     (pCurrBSHVs.sell-pCurrBSHVs.hold) >= UnCertaintyFactorSatisfied_Sell) {
+      tAction = -1; 
+   }
+   
+   if(mLogFileHandle > 0) {
+      string t1 = DoubleToStr(pCurrBSHVs.buy) + ",";
+      string t2 = DoubleToStr(pCurrBSHVs.sell) + ",";
+      string t3 = DoubleToStr(pCurrBSHVs.hold) + "\r\n";
+      FileWriteString(mLogFileHandle, t1);            
+      FileWriteString(mLogFileHandle, t2);      
+      FileWriteString(mLogFileHandle, t3);      
+      
+   }
+   
+   return tAction;
+}
+
+
+//calculates the today's lsot money and error trades and stores them
+//into the output (call by reference) variables oErrorTrades and oMoneyLoss
+void CalculateTodaysLoss(datetime pToday, int &oErrorTrades, double &oMoneyLoss) {
+   oErrorTrades = 0;
+   oMoneyLoss = 0.0f;
+  
+   //!!!datetime tOrderCloseTime;
+   int i, iOrderPosition=-1, iOrdersTotal=OrdersHistoryTotal();
+ 
+   for (i=0; i<iOrdersTotal; i++) {
+      if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
+         if (OrderSymbol() == Symbol()) {
+            //only consider trades of today
+            if(TimeDay(OrderCloseTime()) == TimeDay(pToday) &&
+               TimeMonth(OrderCloseTime()) == TimeMonth(pToday) &&
+               TimeYear(OrderCloseTime()) == TimeYear(pToday)) {
+               
+               //only consider loss trades
+               if(OrderProfit() <= 0) {
+                  oErrorTrades++;
+                  oMoneyLoss += OrderProfit();
+               }    
+            } 
+         }
+      }  
+   }
+}  
+
+
+//calculates the today's lsot money and error trades and stores them
+//into the output (call by reference) variables oErrorTrades and oMoneyLoss
+void ReCalcSL() {
+   /*
+      For every position:
+         Check if Position has minVal of profit
+         if position has minVal of profit set SL to minWin.
+   
+   */
+   
+   for(int i=OrdersTotal()-1; i>=0; i--) {
+      if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES)==true) {
+         if(OrderSymbol()==Symbol()) {
+            //Print("Profits: " + DoubleToStr(OrderProfit())  +", " + DoubleToStr(OrderSwap()) + ", " + DoubleToStr(OrderCommission()));
+            int tNetProfit = OrderProfit()+OrderSwap()+OrderCommission();
+            if(UseTrailingStop && tNetProfit >= MinProfitThreshold) {
+               double tNewSL = 0.0f;
+            
+               if(OrderType() == OP_BUY) {
+                  tNewSL = NormalizeDouble(Ask - (MinProfitThreshold - MinProfitVal) , Digits); //threshold - min win val should be our new difference from current course to the new sl (for example: (15 - 10) = 5)                  
+                  //Print("Calculated new SL value: ", tNewSL);
+                  //Print("OrderOpen: ", OrderOpenPrice());
+                  //Print("Ask: ", Ask);
+               } else if (OrderType() == OP_SELL) {        
+                  tNewSL = NormalizeDouble(Bid + (MinProfitThreshold - MinProfitVal) , Digits); //threshold - min win val should be our new difference from current course to the new sl (for example: (15 - 10) = 5)
+                  //Print("Calculated new SL value: ", tNewSL);
+                  //Print("OrderOpen: ", OrderOpenPrice());
+                  //Print("Bid: ", Bid);               
+               }
+               
+               double minstoplevel = MarketInfo( Symbol(), MODE_STOPLEVEL );
+               //Print( "Minimum Stop Level=", minstoplevel, " points" ); 
+               int tTicketNumber = OrderTicket();
+               bool res=OrderModify(tTicketNumber,OrderOpenPrice(),tNewSL,OrderTakeProfit(),0);//Modify order for TrailingStop
+               
+               if(!res)
+                  Print("Error in OrderModify. Error code=",GetLastError());
+               else
+                  Print("Order modified successfully.");
+            }
+         }
+      }
+   }
+   
+   /*
+   for(int i=0; iPos >= 0; iPos--) {
+   
+   }
+   if(OrderSelect(iPos, SELECT_BY_POS)
+   && OrderMagicNumber() == MagicNumber
+   && OrderSymbol()      == Symbol()
+   && OrderType()        == OP_BUY )
+   TotalBuyProfit += OrderProfit()+OrderSwap()+OrderCommission();
+   
+   oErrorTrades = 0;
+   oMoneyLoss = 0.0f;
+  
+   //!!!datetime tOrderCloseTime;
+   int i, iOrderPosition=-1, iOrdersTotal=OrdersHistoryTotal();
+ 
+   for (i=0; i<iOrdersTotal; i++) {
+      if (OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) {
+         if (OrderSymbol() == Symbol()) {
+            //only consider trades of today
+            if(TimeDay(OrderCloseTime()) == TimeDay(pToday) &&
+               TimeMonth(OrderCloseTime()) == TimeMonth(pToday) &&
+               TimeYear(OrderCloseTime()) == TimeYear(pToday)) {
+               
+               //only consider loss trades
+               if(OrderProfit() <= 0) {
+                  oErrorTrades++;
+                  oMoneyLoss += OrderProfit();
+               }    
+            } 
+         }
+      }  
+   }
+   */
+}  
+
+
+
+
+int performAction(int pAction, BSH_Values &pCurrBSHVs) {
+   int errorTrades = 0;
+   double Geldmenge = AccountBalance();
+   //Print("Geldmenge");
+
+   double moneyLost = 0.0f;
+   
+   CalculateTodaysLoss(Time[0], errorTrades, moneyLost);
+
+   if(errorTrades >= StopTadingByErrorTrades) {
+      Print("Do not perform trade because ErrorTrades exceeded for this day (ErrorTrades: " + IntegerToString(errorTrades) +")");
+      return -1;
+   }
+   
+   if(MathAbs(moneyLost) >= StopTradingByLossMoney) {
+      Print("Do not perform trade because MoneyLost exceeded for this day (MoneyLost: " + DoubleToStr(moneyLost) +")");
+      return -1;   
+   }
+
+   int tTicket = -1;
+   if(OrdersTotal() > OrderLimit) {
+      Print("Maxmimun Order limit reached",AccountFreeMargin());
+      return tTicket;
+   }
+      
+   if(AccountFreeMargin()<(1000*Lots)){
+      Print("We have no money. Free Margin = ",AccountFreeMargin());
+      return tTicket;
+   }     
+
+   if(OrdersTotal() > OrderLimit) {
+      Print("Orderlimit reached. No new order is opened");
+      return -1;
+   }
+   int tStartInMinutes = StartHour * 60;
+   int tCurrentTimeInMinutes = Hour() * 60 + Minute();
+ 
+   if((tCurrentTimeInMinutes <= EndHour*60) && (tCurrentTimeInMinutes >= tStartInMinutes) && (OrdersTotal() <= OrderLimit - 1)){
+      double TPRange_Buy = MaxTP_Buy - MinTP_Buy;
+      double TPRange_Sell = MaxTP_Sell - MinTP_Sell;
+      double SLPRange = MaxSLP - MinSLP;
+      double Lotgroesse;
+      /* 
+        if(OrdersTotal()<1)
+        Lotgroesse= Geldmenge*StartLotSize/(70);
+            
+        else Lotgroesse = (Geldmenge*StartLotSize/(70));
+        Lotgroesse = Lotgroesse-0.5;
+        Lotgroesse = round(Lotgroesse);
+     */
+       Lotgroesse = Lots;
+         
+       if(pAction == +1)  {  
+            for(int i=0; i < OrderAttempts; i++) {
+               double TP = MinTP_Buy + ((TPRange_Buy) * (pCurrBSHVs.buy - CertaintyFactorSatisfied_Buy) / (1.0f - CertaintyFactorSatisfied_Buy)); //NormalizeDouble(Ask + MathMax(MinTP,  pCurrBSHVs.buy * MaxTP), Digits);
+               double SL = MinSLP + ((SLPRange) * (pCurrBSHVs.buy - CertaintyFactorSatisfied_Buy) / (1.0f - CertaintyFactorSatisfied_Buy)); //NormalizeDouble(Ask - MathMax(MinSLP, pCurrBSHVs.buy * MaxSLP), Digits);
+            
+               RefreshRates();
+               
+               TP = NormalizeDouble((Ask + TP), Digits);
+               SL = NormalizeDouble((Ask - SL), Digits);
+               double tAsk = NormalizeDouble(Ask, Digits);
+               //just in case order was not sended (for example, when stock data was already outdated because of fast changes), the ticket number will be -1. Than we try to open the order again until OrderAttempts (InputParam) is reached. 
+               tTicket=OrderSend(Symbol(),OP_BUY,Lotgroesse,tAsk,SLIPPAGE,SL,TP,"AI-EA Buy",16384,0,Green);
+               
+               //print after orderSend because all between RefreshRates() and OrderSend() should be happen very fast
+               //so the prices are not outdated
+               //Print("Ask : ", Ask);
+               //Print("Normalized Ask price : ", tAsk);
+               //Print("CF : ", pCurrBSHVs.buy);
+               //Print("TP : ", TP);
+               //Print("SL : ", SL);
+               
+               if(tTicket != -1){
+                  i = 10;
+                  break;
+               } else {
+                  Print("Order could not send. Try to reopen, attemtp: " + IntegerToString(i));
+                  Print("ErrorCode: " + IntegerToString(GetLastError()));
+               }
+            }
+         }
+         
+      if(pAction == -1) {
+         for(int i=0; i < OrderAttempts; i++) {
+            double TP = MinTP_Sell + ((TPRange_Sell) * (pCurrBSHVs.sell - CertaintyFactorSatisfied_Sell) / (1.0f - CertaintyFactorSatisfied_Sell));  //double TP = NormalizeDouble(Bid - MathMax(MinTP,  pCurrBSHVs.sell * MaxTP ), Digits);
+            double SL = MinSLP + ((SLPRange) * (pCurrBSHVs.sell - CertaintyFactorSatisfied_Sell) / (1.0f - CertaintyFactorSatisfied_Sell)); //double SL = NormalizeDouble(Bid + MathMax(MinSLP, pCurrBSHVs.sell * MaxSLP), Digits);
+              
+            RefreshRates();
+                          
+            TP = NormalizeDouble((Bid - TP), Digits);
+            SL = NormalizeDouble((Bid + SL), Digits);
+            double tBid = NormalizeDouble(Bid, Digits);
+            
+            //just in case order was not sended (for example, when stock data was already outdated because of fast changes), the ticket number will be -1. Than we try to open the order again until OrderAttempts (InputParam) is reached. 
+            tTicket=OrderSend(Symbol(),OP_SELL,Lotgroesse,tBid,SLIPPAGE,SL,TP,"AI-EA Sell",16384,0,Red);
+         
+            
+            //print after orderSend because all between RefreshRates() and OrderSend() should be happen very fast
+            //so the prices are not outdated
+            //Print("Bid price : ", Bid);
+            //Print("Normalized Bid price : ", tBid);
+            //Print("CF : ", pCurrBSHVs.sell);
+            //Print("TP : ", TP);
+            //Print("SL : ", SL);
+            //Print("Bid : ", Bid);
+            
+            if(tTicket != -1){
+               i = 10;
+               break;
+            } else {
+               Print("Order could not send. Try to reopen, attemtp: " + IntegerToString(i));
+               Print("ErrorCode: " + IntegerToString(GetLastError()));
+               Sleep(100);
+            }
+         }
+      }
+   }
+   
+   return tTicket;
+}
+
+
+void closeAfterXHours() {
+   //Programmierung, dass eine geöffnete Order nach x Stunden automatisch geschlossen wird
+   int maxDuration = CloseAfterHoursPassed*60 * 60; // 60 minutes
+   
+   for(int i=OrdersTotal()-1; i>=0; i--) {
+      if(OrderSelect(i,SELECT_BY_POS,MODE_TRADES)==true &&
+         OrderSymbol()==Symbol() &&
+         (TimeCurrent() - OrderOpenTime()) >= maxDuration){
+
+         if(OrderType()==OP_BUY){//(tCurrBSHVs.buy < CertaintyFactorSatisfied)
+            bool result =OrderClose(OrderTicket(),OrderLots(), OrderClosePrice(),3,Blue);;
+         }
+   
+         if(OrderType()==OP_SELL){//(tCurrBSHVs.sell < CertaintyFactorSatisfied)
+            bool result = OrderClose(OrderTicket(),OrderLots(), OrderClosePrice(),3,Blue);
+         }
+      }
+   }
+
+}
+
+BSH_Values *requestLSTM() {
+   string tAdress = ServerURL + "/api_requests/" + API_Request_ID + "/execute";
+   string tPostData = generateLSTMPostData();
+   
+   string   tResult = post(tAdress, tPostData);
+   string   splittedStrings[];
+   
+   //Print("tResult-1", tResult);
+   StringReplace(tResult,"{","");
+   //Print("tResult0", tResult);
+   StringReplace(tResult,"\"result\":","");
+   //Print("tResult1", tResult);
+   StringReplace(tResult,"]","");
+   //Print("tResult2", tResult);
+   StringReplace(tResult,"}","");
+   //Print("tResult3", tResult);
+
+   StringReplace(tResult,"\"output_0\": [","");   
+   //Print("tResult5", tResult);
+   StringReplace(tResult,"\"message\": \"API-Request result retrieved.\"",""); 
+   //Print("tResult6", tResult);
+   
+   StringReplace(tResult," ","");
+   //Print("tResult4", tResult);
+   tResult  = StringSubstr(tResult, 1, StringLen(tResult) - 3); //remove quotes at beginning and end (whereever they came from...)
+   
+   //Print("tResult4", tResult);
+   
+   tResult = StringSubstr(tResult,0,StringLen(tResult)-2);
+   
+   int valueCount = StringSplit(tResult,',',splittedStrings);
+   //Print("splittedStrings0", splittedStrings[0]);
+   //Print("splittedStrings1", splittedStrings[1]);
+   //Print("splittedStrings2", splittedStrings[2]);
+   //Print("valueCount",  valueCount); 
+   if(valueCount!=3) {
+     return NULL;
+   }
+     
+   //Certainty classification values
+   //Print("splittedStrings[0]", splittedStrings[0]);
+
+   BSH_Values* tCurrBSHVs = new BSH_Values(
+      StrToDouble(splittedStrings[0]),
+      StrToDouble(splittedStrings[1]),
+      StrToDouble(splittedStrings[2])
+   );
+
+   return tCurrBSHVs;
+}
+
+/* Some preChecks. If they fail we can skip the
+   current tick calculation
+*/
+bool preChecks() {
+   //checks time frame
+   if(Hour() < StartHour || Hour() > EndHour) {
+      return false;
+   }
+      
+   //check if it is a new bar, if not we just return
+   if(mOldBarTime == Time[0]){  
+      #ifndef _DEBUG  
+         return false;
+      #endif
+      //return false;
+   }
+
+   mOldBarTime = Time[0]; //store current bar timestamp for recognizing new bars
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick() {
+   if(!preChecks())
+      return;
+      
+      /*
+   if(LogFile != NULL && LogFile != "") {
+      mLogFileHandle = FileOpen(LogFile, FILE_WRITE|FILE_ANSI);
+   }*/
+      
+   closePositionsBeforeDayEnd();
+   ReCalcSL();
+   BSH_Values* tCurrBSHVs = requestLSTM();
+   
+   if(tCurrBSHVs == NULL) {
+      return;
+   }
+      
+   int emptyIndiWindowID = WindowFind("empty_indi");      // Searching for indicator window number
+   
+    
+   if (emptyIndiWindowID > 0) { // the indicator has to be added into the chart      
+      drawOnIndicator("Buy",  emptyIndiWindowID, mOldBSHVs.buy,  tCurrBSHVs.buy,  Green);
+      drawOnIndicator("Sell", emptyIndiWindowID, mOldBSHVs.sell, tCurrBSHVs.sell, Red);
+      drawOnIndicator("Hold", emptyIndiWindowID, mOldBSHVs.hold, tCurrBSHVs.hold, Blue);
+   }   
+   
+   mOldBSHVs = tCurrBSHVs;
+            
+   int tAction       = getTradingAction(tCurrBSHVs);    //get a clear buy or sell decision, elsewise do nothing = 0
+   
+   string tStrAction = "";
+   
+   if(tAction == +1) { 
+      tStrAction = "BUY!";
+   } else if (tAction == -1) {
+      tStrAction = "SELL!";
+   } 
+  
+   if(tAction != 0 && AlertMe) {
+      PlaySound("tos-redalert.wav");
+      Alert("Action Detected (", Symbol(), ", ", Period(), "): - " + tStrAction);
+   }
+
+
+   //Trennung von OCO erforderlich wegen Orderlimit, es greift bevor die OCO killen kann bei erreichen Maximaler Orderzahl
+   oneCanclesOther(tAction);
+   int tTicket = performAction(tAction, tCurrBSHVs);
+   closeAfterXHours();
+
+ if(tTicket > 0) {
+      if(OrderSelect(tTicket,SELECT_BY_TICKET,MODE_TRADES)) {
+         Print("Order opened : ",OrderOpenPrice());
+      } else {
+         Print("Error opening order 1: ",GetLastError());
+      }
+   } else {
+      if(GetLastError() != ERR_NO_MQLERROR) {
+         Print("Error opening order 2: ",GetLastError());
+      }
+   }
+   
+   /*
+   if(mLogFileHandle > 0) {
+      FileClose(mLogFileHandle);
+   }*/
+   return;
+}
+
+//+------------------------------------------------------------------+
+//| Timer function                                                   |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+//---
+   
+  }
+
+// reference link https://drive.google.com/drive/folders/1UrU2EbejQOiYMgeNKN6ZOLhwMgSp7Ggm?usp=share_link
